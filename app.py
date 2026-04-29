@@ -20,8 +20,6 @@ st.markdown("""
 <style>
     .title { text-align:center; font-size:34px; font-weight:600; }
     .subtitle { text-align:center; color:gray; margin-bottom:20px; }
-    .card { padding:15px; border-radius:12px; background:#111827; border:1px solid #2d2d2d; }
-    .kpi { padding:15px; border-radius:10px; background:#0f172a; text-align:center; border:1px solid #1f2937; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -35,7 +33,7 @@ st.sidebar.header("Control Panel")
 confidence = st.sidebar.slider("Confidence Threshold", 0.1, 1.0, 0.4)
 mode = st.sidebar.radio("Input Mode", ["Upload Image", "Webcam"])
 
-# ===== CLASS NAMES — exactly as trained (10 classes) =====
+# ===== CLASS NAMES =====
 CLASS_NAMES = {
     0: "Hardhat",
     1: "Mask",
@@ -49,18 +47,18 @@ CLASS_NAMES = {
     9: "vehicle"
 }
 
-# PPE worn correctly (compliant detections)
-PPE_CLASSES = {0: "Hardhat", 1: "Mask", 7: "Safety Vest"}
+PPE_CLASSES = {0, 1, 7}
+VIOLATION_CLASSES = {2, 3, 4}
 
-# Violations (missing PPE)
-VIOLATION_CLASSES = {2: "NO-Hardhat", 3: "NO-Mask", 4: "NO-Safety Vest"}
-
-# Other objects (not PPE-related)
-OTHER_CLASSES = {5: "Person", 6: "Safety Cone", 8: "machinery", 9: "vehicle"}
-
-# ===== PREDICT =====
+# ===== PREDICT (FIXED) =====
 def predict(img):
-    return model.predict(np.array(img), conf=confidence)
+    return model.predict(
+        img,
+        conf=confidence,
+        iou=0.35,        # 🔥 stronger duplicate removal
+        max_det=50,
+        agnostic_nms=True
+    )
 
 # ===== INPUT =====
 image = None
@@ -87,18 +85,60 @@ if image is not None:
     with col2:
         st.subheader("Detection Output")
         results = predict(image)
-        output = results[0].plot()
-        st.image(output, use_container_width=True)
+        st.image(results[0].plot(), use_container_width=True)
 
-    # ===== EXTRACT DATA =====
+    # ===== REMOVE DUPLICATES (IMPORTANT FIX) =====
     detections = []
+    seen = []
+
+    def is_same_object(box1, box2):
+        x11, y11, x12, y12 = box1
+        x21, y21, x22, y22 = box2
+
+        xi1 = max(x11, x21)
+        yi1 = max(y11, y21)
+        xi2 = min(x12, x22)
+        yi2 = min(y12, y22)
+
+        inter = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+
+        area1 = (x12 - x11) * (y12 - y11)
+        area2 = (x22 - x21) * (y22 - y21)
+
+        union = area1 + area2 - inter
+        if union == 0:
+            return False
+
+        return (inter / union) > 0.5
+
     for r in results:
         for box in r.boxes:
+
             cls_id = int(box.cls)
+            conf = float(box.conf)
+
+            # filter weak detections
+            if conf < confidence:
+                continue
+
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            current_box = (x1, y1, x2, y2)
+
+            duplicate = False
+            for old_box, old_cls in seen:
+                if old_cls == cls_id and is_same_object(current_box, old_box):
+                    duplicate = True
+                    break
+
+            if duplicate:
+                continue
+
+            seen.append((current_box, cls_id))
+
             detections.append({
                 "class_id": cls_id,
                 "label": CLASS_NAMES.get(cls_id, f"class_{cls_id}"),
-                "confidence": round(float(box.conf), 3),
+                "confidence": round(conf, 3),
                 "category": (
                     "✅ PPE Worn" if cls_id in PPE_CLASSES else
                     "⚠️ Violation" if cls_id in VIOLATION_CLASSES else
@@ -108,24 +148,22 @@ if image is not None:
 
     df = pd.DataFrame(detections)
 
-    # Count per class
     counts = df["class_id"].value_counts().to_dict() if not df.empty else {}
 
-    hardhat      = counts.get(0, 0)
-    mask         = counts.get(1, 0)
-    no_hardhat   = counts.get(2, 0)
-    no_mask      = counts.get(3, 0)
-    no_vest      = counts.get(4, 0)
-    person       = counts.get(5, 0)
-    safety_cone  = counts.get(6, 0)
-    safety_vest  = counts.get(7, 0)
-    machinery    = counts.get(8, 0)
-    vehicle      = counts.get(9, 0)
-    total        = len(df)
+    hardhat = counts.get(0, 0)
+    mask = counts.get(1, 0)
+    no_hardhat = counts.get(2, 0)
+    no_mask = counts.get(3, 0)
+    no_vest = counts.get(4, 0)
+    person = counts.get(5, 0)
+    safety_cone = counts.get(6, 0)
+    safety_vest = counts.get(7, 0)
+    machinery = counts.get(8, 0)
+    vehicle = counts.get(9, 0)
 
     total_violations = no_hardhat + no_mask + no_vest
 
-    # ===== KPIs — PPE =====
+    # ===== UI =====
     st.markdown("### 🦺 PPE Status")
     c1, c2, c3 = st.columns(3)
     c1.metric("Hardhats ✅", hardhat)
@@ -134,12 +172,9 @@ if image is not None:
 
     st.markdown("### 🚨 Violations")
     v1, v2, v3 = st.columns(3)
-    v1.metric("NO-Hardhat ⚠️", no_hardhat,
-              delta=f"-{no_hardhat}" if no_hardhat else None, delta_color="inverse")
-    v2.metric("NO-Mask ⚠️", no_mask,
-              delta=f"-{no_mask}" if no_mask else None, delta_color="inverse")
-    v3.metric("NO-Safety Vest ⚠️", no_vest,
-              delta=f"-{no_vest}" if no_vest else None, delta_color="inverse")
+    v1.metric("NO-Hardhat ⚠️", no_hardhat)
+    v2.metric("NO-Mask ⚠️", no_mask)
+    v3.metric("NO-Safety Vest ⚠️", no_vest)
 
     st.markdown("### 🏗️ Scene Objects")
     o1, o2, o3, o4 = st.columns(4)
@@ -148,59 +183,16 @@ if image is not None:
     o3.metric("Machinery 🏗️", machinery)
     o4.metric("Vehicles 🚗", vehicle)
 
-    # ===== SAFETY COMPLIANCE LOGIC =====
-    st.markdown("### Safety Compliance Status")
-
-    violations_list = []
-    if no_hardhat > 0: violations_list.append(f"{no_hardhat} person(s) without hardhat")
-    if no_mask    > 0: violations_list.append(f"{no_mask} person(s) without mask")
-    if no_vest    > 0: violations_list.append(f"{no_vest} person(s) without safety vest")
-
+    # ===== STATUS =====
     if total_violations > 0:
-        st.error(f"🚨 Non-Compliant: " + " | ".join(violations_list))
-    elif hardhat == 0 and mask == 0 and safety_vest == 0:
-        st.info("ℹ️ No PPE items detected in this image.")
+        st.error("🚨 Non-Compliant detected")
     else:
-        ppe_summary = []
-        if hardhat > 0:     ppe_summary.append(f"{hardhat} Hardhat(s)")
-        if mask > 0:        ppe_summary.append(f"{mask} Mask(s)")
-        if safety_vest > 0: ppe_summary.append(f"{safety_vest} Safety Vest(s)")
-        st.success(f"✅ Full Compliance: {', '.join(ppe_summary)} detected correctly.")
-
-    # ===== CHART =====
-    if total > 0:
-        st.markdown("### Detection Distribution")
-        present_classes = {k: v for k, v in CLASS_NAMES.items() if counts.get(k, 0) > 0}
-        labels = list(present_classes.values())
-        values = [counts[k] for k in present_classes]
-
-        color_map = {
-            0: "#22c55e",   # Hardhat — green
-            1: "#3b82f6",   # Mask — blue
-            2: "#ef4444",   # NO-Hardhat — red
-            3: "#f97316",   # NO-Mask — orange
-            4: "#eab308",   # NO-Safety Vest — yellow
-            5: "#94a3b8",   # Person — gray
-            6: "#06b6d4",   # Safety Cone — cyan
-            7: "#10b981",   # Safety Vest — emerald
-            8: "#8b5cf6",   # machinery — purple
-            9: "#f59e0b",   # vehicle — amber
-        }
-        colors = [color_map[k] for k in present_classes]
-
-        fig, ax = plt.subplots()
-        ax.pie(values, labels=labels, autopct="%1.1f%%", colors=colors)
-        ax.set_title("Detected Classes")
-        st.pyplot(fig)
+        st.success("✅ Safe Scene Detected")
 
     # ===== REPORT =====
-    st.markdown("### Detection Report")
-    if df.empty:
-        st.info("No detections found at the current confidence threshold. Try lowering the threshold.")
-    else:
-        st.dataframe(df[["label", "category", "confidence"]], use_container_width=True)
-        csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button("Download Report", csv, "ppe_report.csv", "text/csv")
+    if total_violations > 0:
+        st.markdown("### Detection Report")
+        st.dataframe(df)
 
 # ===== FOOTER =====
 st.markdown("---")
