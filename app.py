@@ -85,7 +85,9 @@ if image is not None:
     with col2:
         st.subheader("Detection Output")
         results = predict(image)
-        st.image(results[0].plot(), use_container_width=True)
+        annotated = results[0].plot()
+        annotated = annotated[..., ::-1]
+        st.image(annotated, use_container_width=True)
 
     # ===== REMOVE DUPLICATES (IMPORTANT FIX) =====
     detections = []
